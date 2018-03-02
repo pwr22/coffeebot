@@ -1,6 +1,9 @@
 use strict;
 use warnings;
 use feature 'say';
+use Log::ger;
+use Log::ger::Output 'Screen';
+use Log::ger::Util;
 use DDP;
 
 use File::JSON::Slurper qw( read_json );
@@ -9,6 +12,9 @@ use DateTime;
 
 our $VERSION = v0.0.1;
 
+Log::ger::Util::set_level("trace");
+
+log_debug 'reading config';
 my $conf = read_json('config.json');
 my $token = $conf->{token};
 my @users_with_limits = keys $conf->{coffees_per_day}->%*;
@@ -26,15 +32,26 @@ $slack->on(message => sub {
   my $user_name  = $slack->find_user_name($user_id);
   my $text       = $event->{text};
 
-  return unless defined $text; # nothing do do if its not an event with text!
+  log_trace 'got event "%s"', $event;
+
+  unless (defined $text) {
+    log_debug 'skipping event type without text';
+    return;
+  }
 
   # send people away with a preview message if they DM
   if ($channel_id =~ /^D/) {
     my $preview_number = ++$previews_sent_to{$user_id};
 
-    return if $preview_number >= 3; # ignore them if they're harassing us
+    log_info 'got a DM from ID %s, this is number %d from this user', $user_id, $preview_number;
 
+    if ($preview_number >= 3) {
+      log_info 'ignoring it as they are harassing us';
+      return;
+    }
+    
     if ($preview_number == 2) { # let them know a girl needs some space from time to time!
+        log_info 'sending them a firm message not to message again';
         $slack->send_message($channel_id => "I've already asked you nicely not to message yet :smile:");
         $slack->send_message($channel_id => "I'll let you know when I'm ready for your attention :wink:");
 
@@ -46,11 +63,12 @@ $slack->on(message => sub {
       $text =~ /(\bhey\b|\bhi\b|\bhello\b|\b(?:good\b?)?(morning|afternoon|evening)\b|\bafternoon\b|\bwhat'?s\bup\b?|\bwass?up\b)/i
       || $text =~ /\b(.*)\bkaffina\b/i
     ) {
+        log_info 'they are being polite with "%s" so responding in kind', $1;
         my $formatted = ucfirst $1 =~ s/^\s+|\s+$//gr; # trim whitespace and capitalise
         $slack->send_message($channel_id => "$formatted yourself :grinning:");
     }
 
-    # Explain our perks
+    log_info 'sending them the preview text';
     $slack->send_message($channel_id => "Please don't chat with me right now since I'm not ready just yet! :blush:");
     $slack->send_message($channel_id => "Soon I'll be able to help you organise coffee breaks :coffee:");
     $slack->send_message($channel_id => "Without distracting your colleagues who are busy working hard :computer:");
@@ -64,14 +82,20 @@ $slack->on(message => sub {
   # skip anything non #coffee
   my $coffee_chan_id = $slack->find_channel_id('coffee')
     or die 'cannot get ID for coffee channel';
-  return unless $channel_id eq $coffee_chan_id;
+  unless ($channel_id eq $coffee_chan_id) {
+    log_debug 'skipping message because it is not in the coffee channel';
+    return; 
+  }
 
   # ignore things that aren't the coffee request
-  return unless $text =~ /\bc[oa]ff?e?e?\b|\bping\b/i;
+  unless ($text =~ /\bc[oa]ff?e?e?\b|\bping\b/i) {
+    log_debug 'skipping message because it is not a request for coffee';
+    return;
+  }
 
   # check if we're reached tomorrow yet
   unless ($today == DateTime->today) { 
-      say 'resetting limits';
+      log_info 'resetting limits since it is now the next day';
       $today = DateTime->today;
       $coffees_today = 0;
   }
@@ -79,13 +103,17 @@ $slack->on(message => sub {
   $coffees_today++;
   my @users_beyond_limit = grep { $coffees_today > $conf->{coffees_per_day}->{$_} } @users_with_limits; 
 
-  return unless @users_beyond_limit;
+  unless (@users_beyond_limit) {
+    log_debug 'no users are beyond their limits so nothing to do';
+    return;
+  }
 
   my $list_of_users =
     join ' and ', 
     map { "<\@$_>" } 
     map { $slack->find_user_id($_) or die "cannot get ID for $_ user" } @users_beyond_limit;
 
+  log_info 'sending automatic polite decline message';
   $slack->send_message($channel_id => "No more coffes for $list_of_users but thanks for asking :smile:");
 });
 
