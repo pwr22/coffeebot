@@ -7,6 +7,7 @@ use Log::ger::Util;
 use DDP;
 
 use File::JSON::Slurper qw( read_json );
+use DBM::Deep;
 use Mojo::SlackRTM;
 use DateTime;
 
@@ -21,9 +22,14 @@ my @users_with_limits = keys $conf->{coffees_per_day}->%*;
  
 my $slack = Mojo::SlackRTM->new(token => $token);
 
-my $today = DateTime->today;
-my $coffees_today = 0;
-my %previews_sent_to;
+log_debug 'opening state database';
+tie my %state, 'DBM::Deep', 'state.db';
+
+log_trace 'previous state is "%s"', \%state;
+
+$state{today} //= DateTime->today; # we have to store this too so we know what day the coffees state is from
+$state{coffees_today} //= 0;
+$state{previews_sent_to} //= {};
 
 $slack->on(message => sub {
   my ($slack, $event) = @_;
@@ -41,7 +47,7 @@ $slack->on(message => sub {
 
   # send people away with a preview message if they DM
   if ($channel_id =~ /^D/) {
-    my $preview_number = ++$previews_sent_to{$user_id};
+    my $preview_number = ++$state{previews_sent_to}{$user_id};
 
     log_info 'got a DM from ID %s, this is number %d from this user', $user_id, $preview_number;
 
@@ -94,14 +100,14 @@ $slack->on(message => sub {
   }
 
   # check if we're reached tomorrow yet
-  unless ($today == DateTime->today) { 
+  unless ($state{today} == DateTime->today) { 
       log_info 'resetting limits since it is now the next day';
-      $today = DateTime->today;
-      $coffees_today = 0;
+      $state{today} = DateTime->today;
+      $state{coffees_today} = 0;
   }
   
-  $coffees_today++;
-  my @users_beyond_limit = grep { $coffees_today > $conf->{coffees_per_day}->{$_} } @users_with_limits; 
+  $state{coffees_today}++;
+  my @users_beyond_limit = grep { $state{coffees_today} > $conf->{coffees_per_day}->{$_} } @users_with_limits; 
 
   unless (@users_beyond_limit) {
     log_debug 'no users are beyond their limits so nothing to do';
