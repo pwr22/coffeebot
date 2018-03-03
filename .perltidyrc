@@ -1,0 +1,11 @@
+-pbp    # start with perl best practices settings as a base
+-nst    # don't print to standard out
+--maximum-line-length=145
+-i=4    # Indentation of 4 columns
+-ci=4   # Continuation indentation of 4 columns
+-nolq   # don't outdent long quotes
+-nolc   # don't outdent long comments
+-nola   # don't outdent labels
+-vt=0   # minimum vertical tightness
+-ple    # preserve line endings
+-wn     # weld nested containers
