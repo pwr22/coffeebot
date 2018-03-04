@@ -7,120 +7,256 @@ use Log::ger::Util;
 use DDP;
 
 use File::JSON::Slurper qw( read_json );
-use DBM::Deep;
 use Mojo::SlackRTM;
+use Mojo::IOLoop;
 use DateTime;
+use Lingua::Conjunction;
+Lingua::Conjunction->penultimate(0);
 
 our $VERSION = v0.0.1;
 
 Log::ger::Util::set_level("trace");
 
 log_debug 'reading config';
-my $conf              = read_json('config.json');
-my $token             = $conf->{token};
-my @users_with_limits = keys $conf->{coffees_per_day}->%*;
+my $conf  = read_json('config.json');
+my $token = $conf->{token};
 
 my $slack = Mojo::SlackRTM->new( token => $token );
 
-log_debug 'opening state database';
-tie my %state, 'DBM::Deep', 'state.db';
+my $forming_a_party = 0;
+my %party_responses = ();
+my $party_requestor = undef;
 
-log_trace 'previous state is "%s"', \%state;
+my $timer_id;
 
-$state{today}            //= DateTime->today;    # we have to store this too so we know what day the coffees state is from
-$state{coffees_today}    //= 0;
-$state{previews_sent_to} //= {};
+my $idle_handler = sub {
+    my ( $slack, $event ) = @_;
+    my $channel_id = $event->{channel};
+    my $user_id    = $event->{user};
+    my $user_name  = $slack->find_user_name($user_id);
+    my $text       = $event->{text};
 
-$slack->on(
-    message => sub {
-        my ( $slack, $event ) = @_;
-        my $channel_id = $event->{channel};
-        my $user_id    = $event->{user};
-        my $user_name  = $slack->find_user_name($user_id);
-        my $text       = $event->{text};
+    log_trace 'got event "%s" in idle handler', $event;
 
-        log_trace 'got event "%s"', $event;
-
-        unless ( defined $text ) {
-            log_debug 'skipping event type without text';
-            return;
-        }
-
-        # send people away with a preview message if they DM
-        if ( $channel_id =~ /^D/ ) {
-            my $preview_number = ++$state{previews_sent_to}{$user_id};
-
-            log_info 'got a DM from ID %s, this is number %d from this user', $user_id, $preview_number;
-
-            if ( $preview_number >= 3 ) {
-                log_info 'ignoring it as they are harassing us';
-                return;
-            }
-
-            if ( $preview_number == 2 ) {    # let them know a girl needs some space from time to time!
-                log_info 'sending them a firm message not to message again';
-                $slack->send_message( $channel_id => "I've already asked you nicely not to message yet :smile:" );
-                $slack->send_message( $channel_id => "I'll let you know when I'm ready for your attention :wink:" );
-
-                return;
-            }
-
-            # respond to pleasantries and salutations in kind
-            if (   $text =~ /(\bhey\b|\bhi\b|\bhello\b|\b(?:good\b?)?(morning|afternoon|evening)\b|\bafternoon\b|\bwhat'?s\bup\b?|\bwass?up\b)/i
-                || $text =~ /\b(.*)\bkaffina\b/i )
-            {
-                log_info 'they are being polite with "%s" so responding in kind', $1;
-                my $formatted = ucfirst $1 =~ s/^\s+|\s+$//gr;    # trim whitespace and capitalise
-                $slack->send_message( $channel_id => "$formatted yourself :grinning:" );
-            }
-
-            log_info 'sending them the preview text';
-            $slack->send_message( $channel_id => "Please don't chat with me right now since I'm not ready just yet! :blush:" );
-            $slack->send_message( $channel_id => "Soon I'll be able to help you organise coffee breaks :coffee:" );
-            $slack->send_message( $channel_id => "Without distracting your colleagues who are busy working hard :computer:" );
-            $slack->send_message( $channel_id => "Or have just had too much caffeine today :grinning_face_with_one_large_and_one_small_eye:" );
-            $slack->send_message( $channel_id =>
-                    "And of course I'll be helping you out if you're ever in one of those situations yourself! :helmet_with_white_cross:" );
-            $slack->send_message( $channel_id => "So everyone gets the frictionless coffee experience they deserve :kissing_heart:" );
-
-            return;
-        }
-
-        # skip anything non #coffee
-        my $coffee_chan_id = $slack->find_channel_id('coffee')
-            or die 'cannot get ID for coffee channel';
-        unless ( $channel_id eq $coffee_chan_id ) {
-            log_debug 'skipping message because it is not in the coffee channel';
-            return;
-        }
-
-        # ignore things that aren't the coffee request
-        unless ( $text =~ /\bc[oa]ff?e?e?\b|\bping\b/i ) {
-            log_debug 'skipping message because it is not a request for coffee';
-            return;
-        }
-
-        # check if we're reached tomorrow yet
-        unless ( $state{today} == DateTime->today ) {
-            log_info 'resetting limits since it is now the next day';
-            $state{today}         = DateTime->today;
-            $state{coffees_today} = 0;
-        }
-
-        $state{coffees_today}++;
-        my @users_beyond_limit = grep { $state{coffees_today} > $conf->{coffees_per_day}->{$_} } @users_with_limits;
-
-        unless (@users_beyond_limit) {
-            log_debug 'no users are beyond their limits so nothing to do';
-            return;
-        }
-
-        my $list_of_users = join ' and ', map {"<\@$_>"}
-            map { $slack->find_user_id($_) or die "cannot get ID for $_ user" } @users_beyond_limit;
-
-        log_info 'sending automatic polite decline message';
-        $slack->send_message( $channel_id => "No more coffes for $list_of_users but thanks for asking :smile:" );
+    if ($forming_a_party) {
+        log_debug 'skipping event in idle hander since a party is forming';
+        return;
     }
-);
+
+    unless ( defined $text ) {
+        log_debug 'skipping event type without text';
+        return;
+    }
+
+    unless ( $channel_id =~ /^D/ ) {
+        log_debug 'skipping non-DM';
+        return;
+    }
+
+    unless ( grep { $user_name eq $_ } $conf->{users}->@* ) {
+        log_debug 'skipping message from unwanted user';
+        return;
+    }
+
+    unless ( $text =~ /\bcoffee\b/i ) {
+        log_debug 'sending polite response to message I do not understand';
+        $slack->send_message( $channel_id => "Sorry, I'm not sure what you meant. Try `I'd like to grab a coffee`" );
+        return;
+    }
+
+    log_info 'got a request to form a party from %s on %s', $user_name;
+    $forming_a_party = 1;
+    %party_responses = ();
+
+    $party_requestor = $user_name;
+    my @other_candidates    = grep { $_ ne $party_requestor } $conf->{users}->@*;
+    my @other_candidate_ids = map  { $slack->find_user_id($_) } @other_candidates;
+
+    log_debug 'sending acknowledgement';
+    $slack->send_message(
+        $channel_id => sprintf 'Ok, I will ask %s for you',
+        conjunction( map {"<\@$_>"} @other_candidate_ids )
+    );
+
+    my %dm_channels = get_dm_channels($slack);
+
+    for (@other_candidates) {
+        my $cand_id = $slack->find_user_id($_);
+
+        log_debug 'sending request to %s', $_;
+
+        $slack->send_message(
+            $dm_channels{$cand_id} => sprintf '<@%s> would like to grab a coffee, are you in?',
+            $user_id
+        );
+
+        $party_responses{$_} = undef;    # init a slot we will fill later
+    }
+
+    $timer_id = Mojo::IOLoop->timer(
+        120 => sub {
+            my @users_to_message = grep { $party_responses{$_} } keys %party_responses;
+            push @users_to_message, $party_requestor;
+            my @user_ids_to_message = map { $slack->find_user_id($_) } @users_to_message;
+
+            my @users_to_timeout    = grep { !defined $party_responses{$_} } keys %party_responses;
+            my @user_ids_to_timeout = map  { $slack->find_user_id($_) } @users_to_timeout;
+            my $friendly_list = conjunction( map {"<\@$_>"} @user_ids_to_timeout );
+
+            my %dm_channels = get_dm_channels($slack);
+
+            for my $party_member (@users_to_message) {
+                log_debug 'sending timeout summary to %s', $party_member;
+                $slack->send_message(
+                    $dm_channels{ $slack->find_user_id($party_member) } => "$friendly_list didn't respond" );
+            }
+
+            for my $user_to_timeout (@users_to_timeout) {
+                log_debug 'timing out %s after two minutes', $user_to_timeout;
+                $party_responses{$user_to_timeout} = 0;
+
+                log_debug 'telling %s that they have timed out', $user_to_timeout;
+                $slack->send_message( $dm_channels{ $slack->find_user_id($user_to_timeout) } =>
+                        q{Sorry :sob:. You didn't respond in time} );
+            }
+
+            $forming_a_party = 0;
+            Mojo::IOLoop->remove($timer_id);    # remove myself
+
+            # send confirmation message
+            if ( @users_to_message == 1 ) {
+                log_debug 'send consolation to requestor that they are on their own';
+                $slack->send_message( $dm_channels{ $slack->find_user_id($party_requestor) } =>
+                        q{Sorry :sob:. It looks like you're on your own for this one} );
+            }
+            else {
+                log_debug 'send everyone on their way for coffee';
+
+                pop @user_ids_to_message; # we no longer need to message the requestor
+
+                my $friendly_list = conjunction( map {"<\@$_>"} @user_ids_to_message );
+                $slack->send_message(
+                    $dm_channels{ $slack->find_user_id($party_requestor) } => "$friendly_list will be coming to your desk" );
+
+                for my $user (@user_ids_to_message) {
+                    $slack->send_message(
+                        $dm_channels{$user} => sprintf q{Everyone is meeting at <@%s>'s desk},
+                        $slack->find_user_id($party_requestor)
+                    );
+                }
+            }
+        }
+    );
+};
+
+my $party_handler = sub {
+    my ( $slack, $event ) = @_;
+    my $channel_id = $event->{channel};
+    my $user_id    = $event->{user};
+    my $user_name  = $slack->find_user_name($user_id);
+    my $text       = $event->{text};
+
+    log_trace 'got event "%s" in party handler', $event;
+
+    unless ($forming_a_party) {
+        log_debug 'skipping event in party hander since no party is forming';
+        return;
+    }
+
+    unless ( defined $text ) {
+        log_debug 'skipping event type without text';
+        return;
+    }
+
+    unless ( $channel_id =~ /^D/ ) {
+        log_debug 'skipping non-DM';
+        return;
+    }
+
+    my @users_we_are_waiting_for = grep { !defined $party_responses{$_} } keys %party_responses;
+
+    unless ( grep { $user_name eq $_ } @users_we_are_waiting_for ) {
+        log_debug 'skipping message from unwanted user';
+        return;
+    }
+
+    unless ( $text =~ /(\byes\b|\bno\b)/i ) {
+        log_debug 'sending polite response to message I do not understand';
+        $slack->send_message( $channel_id => "Sorry, I'm not sure what you meant. Try `yes` or `no`" );
+        return;
+    }
+
+    my $response = lc $1;
+
+    log_info 'got a response to a party request from %s', $user_name;
+    $party_responses{$user_name} = $response =~ /\byes\b/i ? 1 : 0;
+
+    log_debug 'sending acknowledgement';
+    $slack->send_message( $channel_id => 'Thanks, I will let everyone know' );
+
+    my @users_to_message = grep { $_ ne $user_name && ( !defined $party_responses{$_} || $party_responses{$_} ) }
+        keys %party_responses;
+    push @users_to_message, $party_requestor;
+
+    my %dm_channels = get_dm_channels($slack);
+
+    for (@users_to_message) {
+        log_debug 'passing on response from %s to %s', $user_name, $_;
+        $slack->send_message(
+            $dm_channels{ $slack->find_user_id($_) } => sprintf '<@%s> is %s',
+            $user_id, $party_responses{$user_name} ? 'in' : 'out'
+        );
+    }
+
+    my $responses_remaining = grep { !defined $_ } values %party_responses;
+    unless ($responses_remaining) {    # we're done here
+        $forming_a_party = 0;
+        Mojo::IOLoop->remove($timer_id);    # no need for this anymore
+
+        my @users_to_message    = grep { $party_responses{$_} } keys %party_responses;
+        my @user_ids_to_message = map  { $slack->find_user_id($_) } @users_to_message;
+
+        # send confirmation message
+        unless ( @users_to_message ) {
+            log_debug 'send consolation to requestor that they are on their own';
+            $slack->send_message( $dm_channels{ $slack->find_user_id($party_requestor) } =>
+                    q{Sorry :sob:. It looks like you're on your own for this one} );
+        }
+        else {
+            log_debug 'send everyone on their way for coffee';
+
+            my $friendly_list = conjunction( map {"<\@$_>"} @user_ids_to_message );
+            $slack->send_message(
+                $dm_channels{ $slack->find_user_id($party_requestor) } => "$friendly_list will be coming to your desk" );
+
+            for my $user (@user_ids_to_message) {
+                $slack->send_message(
+                    $dm_channels{$user} => sprintf q{Everyone is meeting at <@%s>'s desk},
+                    $slack->find_user_id($party_requestor)
+                );
+            }
+        }
+
+    }
+};
+
+$slack->on( message => $idle_handler );
+$slack->on( message => $party_handler );
+
+# Mojo::IOLoop->recurring(
+#     5 => sub {
+#         say sprintf 'forming a party: %s', $forming_a_party ? 'true' : 'false';
+#         p %party_responses;
+#         my %chans = get_dm_channels($slack);
+#         for ( keys %chans ) {
+#             say $slack->find_user_name($_);
+#         }
+#     }
+# );
 
 $slack->start;
+
+sub get_dm_channels {
+    my $slack = shift;
+    return map { $_->{user} => $_->{id} } $slack->metadata->{ims}->@*;
+}
