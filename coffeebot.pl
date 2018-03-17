@@ -23,13 +23,12 @@ my $token = $conf->{token};
 
 my $slack = Mojo::SlackRTM->new( token => $token );
 
-my $forming_a_party = 0;
 my %party_responses = ();
 my $party_requestor = undef;
 
-my $timer_id;
+my ( $idle_handler, $party_handler, $timer_id );
 
-my $idle_handler = sub {
+$idle_handler = sub {
     my ( $slack, $event ) = @_;
     my $channel_id = $event->{channel};
     my $user_id    = $event->{user};
@@ -37,11 +36,6 @@ my $idle_handler = sub {
     my $text       = $event->{text};
 
     log_trace 'got event "%s" in idle handler', $event;
-
-    if ($forming_a_party) {
-        log_debug 'skipping event in idle hander since a party is forming';
-        return;
-    }
 
     unless ( defined $text ) {
         log_debug 'skipping event type without text';
@@ -65,10 +59,12 @@ my $idle_handler = sub {
     }
 
     log_info 'got a request to form a party from %s on %s', $user_name;
-    $forming_a_party = 1;
-    %party_responses = ();
+    $slack->unsubscribe( message => $idle_handler );    # start listening for party responses
+    $slack->on( message => $party_handler );
 
+    %party_responses = ();
     $party_requestor = $user_name;
+
     my @other_candidates    = grep { $_ ne $party_requestor } $conf->{users}->@*;
     my @other_candidate_ids = map  { $slack->find_user_id($_) } @other_candidates;
 
@@ -120,8 +116,9 @@ my $idle_handler = sub {
                         q{Sorry :sob:. You didn't respond in time} );
             }
 
-            $forming_a_party = 0;
             Mojo::IOLoop->remove($timer_id);    # remove myself
+            $slack->unsubscribe( message => $party_handler );    # switch back to waiting for a party to form
+            $slack->on( message => $idle_handler );
 
             # send confirmation message
             if ( @users_to_message == 1 ) {
@@ -132,11 +129,11 @@ my $idle_handler = sub {
             else {
                 log_debug 'send everyone on their way for coffee';
 
-                pop @user_ids_to_message; # we no longer need to message the requestor
+                pop @user_ids_to_message;                        # we no longer need to message the requestor
 
                 my $friendly_list = conjunction( map {"<\@$_>"} @user_ids_to_message );
-                $slack->send_message(
-                    $dm_channels{ $slack->find_user_id($party_requestor) } => "$friendly_list will be coming to your desk" );
+                $slack->send_message( $dm_channels{ $slack->find_user_id($party_requestor) } =>
+                        "$friendly_list will be coming to your desk" );
 
                 for my $user (@user_ids_to_message) {
                     $slack->send_message(
@@ -149,7 +146,7 @@ my $idle_handler = sub {
     );
 };
 
-my $party_handler = sub {
+$party_handler = sub {
     my ( $slack, $event ) = @_;
     my $channel_id = $event->{channel};
     my $user_id    = $event->{user};
@@ -157,11 +154,6 @@ my $party_handler = sub {
     my $text       = $event->{text};
 
     log_trace 'got event "%s" in party handler', $event;
-
-    unless ($forming_a_party) {
-        log_debug 'skipping event in party hander since no party is forming';
-        return;
-    }
 
     unless ( defined $text ) {
         log_debug 'skipping event type without text';
@@ -210,14 +202,15 @@ my $party_handler = sub {
 
     my $responses_remaining = grep { !defined $_ } values %party_responses;
     unless ($responses_remaining) {    # we're done here
-        $forming_a_party = 0;
-        Mojo::IOLoop->remove($timer_id);    # no need for this anymore
+        Mojo::IOLoop->remove($timer_id);    # switch back to waiting for a party to form
+        $slack->unsubscribe( message => $party_handler );
+        $slack->on( message => $idle_handler );
 
         my @users_to_message    = grep { $party_responses{$_} } keys %party_responses;
         my @user_ids_to_message = map  { $slack->find_user_id($_) } @users_to_message;
 
         # send confirmation message
-        unless ( @users_to_message ) {
+        unless (@users_to_message) {
             log_debug 'send consolation to requestor that they are on their own';
             $slack->send_message( $dm_channels{ $slack->find_user_id($party_requestor) } =>
                     q{Sorry :sob:. It looks like you're on your own for this one} );
@@ -226,8 +219,8 @@ my $party_handler = sub {
             log_debug 'send everyone on their way for coffee';
 
             my $friendly_list = conjunction( map {"<\@$_>"} @user_ids_to_message );
-            $slack->send_message(
-                $dm_channels{ $slack->find_user_id($party_requestor) } => "$friendly_list will be coming to your desk" );
+            $slack->send_message( $dm_channels{ $slack->find_user_id($party_requestor) } =>
+                    "$friendly_list will be coming to your desk" );
 
             for my $user (@user_ids_to_message) {
                 $slack->send_message(
@@ -240,8 +233,7 @@ my $party_handler = sub {
     }
 };
 
-$slack->on( message => $idle_handler );
-$slack->on( message => $party_handler );
+$slack->on( message => $idle_handler );    # begin by waiting for a party to form
 
 # Mojo::IOLoop->recurring(
 #     5 => sub {
