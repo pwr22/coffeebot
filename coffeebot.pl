@@ -1,6 +1,6 @@
 use strict;
 use warnings;
-use feature 'say';
+use feature qw( say current_sub );
 use Log::ger;
 use Log::ger::Output 'Screen';
 use Log::ger::Util;
@@ -9,6 +9,7 @@ use DDP;
 use File::JSON::Slurper qw( read_json );
 use Mojo::SlackRTM;
 use Mojo::IOLoop;
+use Mojo::Promise;
 use DateTime;
 use Lingua::Conjunction;
 Lingua::Conjunction->penultimate(0);
@@ -26,9 +27,9 @@ my $slack = Mojo::SlackRTM->new( token => $token );
 my %party_responses = ();
 my $party_requestor = undef;
 
-my ( $idle_handler, $party_handler, $timer_id );
+my ( $party_handler, $party_promise, $party_timer_id );
 
-$idle_handler = sub {
+sub idle_handler {
     my ( $slack, $event ) = @_;
     my $channel_id = $event->{channel};
     my $user_id    = $event->{user};
@@ -59,9 +60,10 @@ $idle_handler = sub {
     }
 
     log_info 'got a request to form a party from %s on %s', $user_name;
-    $slack->unsubscribe( message => $idle_handler );    # start listening for party responses
+    $slack->unsubscribe( message => \&idle_handler );    # start listening for party responses
     $slack->on( message => $party_handler );
 
+    $party_promise   = Mojo::Promise->new();
     %party_responses = ();
     $party_requestor = $user_name;
 
@@ -89,15 +91,15 @@ $idle_handler = sub {
         $party_responses{$_} = undef;    # init a slot we will fill later
     }
 
-    $timer_id = Mojo::IOLoop->timer(
+    $party_timer_id = Mojo::IOLoop->timer(
         120 => sub {
-            my @users_to_message = grep { $party_responses{$_} } keys %party_responses;
+            my @users_to_message = users_in_party();
             push @users_to_message, $party_requestor;
             my @user_ids_to_message = map { $slack->find_user_id($_) } @users_to_message;
 
-            my @users_to_timeout    = grep { !defined $party_responses{$_} } keys %party_responses;
-            my @user_ids_to_timeout = map  { $slack->find_user_id($_) } @users_to_timeout;
-            my $friendly_list = conjunction( map {"<\@$_>"} @user_ids_to_timeout );
+            my @users_to_timeout    = users_not_in_party();
+            my @user_ids_to_timeout = map { $slack->find_user_id($_) } @users_to_timeout;
+            my $friendly_list       = conjunction( map {"<\@$_>"} @user_ids_to_timeout );
 
             my %dm_channels = get_dm_channels($slack);
 
@@ -116,35 +118,42 @@ $idle_handler = sub {
                         q{Sorry :sob:. You didn't respond in time} );
             }
 
-            Mojo::IOLoop->remove($timer_id);    # remove myself
-            $slack->unsubscribe( message => $party_handler );    # switch back to waiting for a party to form
-            $slack->on( message => $idle_handler );
-
-            # send confirmation message
-            if ( @users_to_message == 1 ) {
-                log_debug 'send consolation to requestor that they are on their own';
-                $slack->send_message( $dm_channels{ $slack->find_user_id($party_requestor) } =>
-                        q{Sorry :sob:. It looks like you're on your own for this one} );
-            }
-            else {
-                log_debug 'send everyone on their way for coffee';
-
-                pop @user_ids_to_message;                        # we no longer need to message the requestor
-
-                my $friendly_list = conjunction( map {"<\@$_>"} @user_ids_to_message );
-                $slack->send_message( $dm_channels{ $slack->find_user_id($party_requestor) } =>
-                        "$friendly_list will be coming to your desk" );
-
-                for my $user (@user_ids_to_message) {
-                    $slack->send_message(
-                        $dm_channels{$user} => sprintf q{Everyone is meeting at <@%s>'s desk},
-                        $slack->find_user_id($party_requestor)
-                    );
-                }
-            }
+            $party_promise->resolve();
         }
     );
-};
+
+    my $res = $party_promise->finally( sub {
+        my @users_to_message = users_in_party();
+        my @user_ids_to_message = map { $slack->find_user_id($_) } @users_to_message;
+
+        # send confirmation message
+        unless (@users_to_message) {
+            log_debug 'send consolation to requestor that they are on their own';
+            $slack->send_message( $dm_channels{ $slack->find_user_id($party_requestor) } =>
+                    q{Sorry :sob:. It looks like you're on your own for this one} );
+        }
+        else {
+            log_debug 'send everyone on their way for coffee';
+
+            my $friendly_list = conjunction( map {"<\@$_>"} @user_ids_to_message );
+            $slack->send_message( $dm_channels{ $slack->find_user_id($party_requestor) } =>
+                    "$friendly_list will be coming to your desk" );
+
+            for my $user (@user_ids_to_message) {
+                $slack->send_message(
+                    $dm_channels{$user} => sprintf q{Everyone is meeting at <@%s>'s desk},
+                    $slack->find_user_id($party_requestor)
+                );
+            }
+        }
+
+        log_debug 'going back to waiting for a party to form';
+
+        Mojo::IOLoop->remove($party_timer_id);    # switch back to waiting for a party to form
+        $slack->unsubscribe( message => $party_handler );
+        $slack->on( message => \&idle_handler );
+    } )->wait;
+}
 
 $party_handler = sub {
     my ( $slack, $event ) = @_;
@@ -165,7 +174,7 @@ $party_handler = sub {
         return;
     }
 
-    my @users_we_are_waiting_for = grep { !defined $party_responses{$_} } keys %party_responses;
+    my @users_we_are_waiting_for = users_not_in_party();
 
     unless ( grep { $user_name eq $_ } @users_we_are_waiting_for ) {
         log_debug 'skipping message from unwanted user';
@@ -202,53 +211,23 @@ $party_handler = sub {
 
     my $responses_remaining = grep { !defined $_ } values %party_responses;
     unless ($responses_remaining) {    # we're done here
-        Mojo::IOLoop->remove($timer_id);    # switch back to waiting for a party to form
-        $slack->unsubscribe( message => $party_handler );
-        $slack->on( message => $idle_handler );
-
-        my @users_to_message    = grep { $party_responses{$_} } keys %party_responses;
-        my @user_ids_to_message = map  { $slack->find_user_id($_) } @users_to_message;
-
-        # send confirmation message
-        unless (@users_to_message) {
-            log_debug 'send consolation to requestor that they are on their own';
-            $slack->send_message( $dm_channels{ $slack->find_user_id($party_requestor) } =>
-                    q{Sorry :sob:. It looks like you're on your own for this one} );
-        }
-        else {
-            log_debug 'send everyone on their way for coffee';
-
-            my $friendly_list = conjunction( map {"<\@$_>"} @user_ids_to_message );
-            $slack->send_message( $dm_channels{ $slack->find_user_id($party_requestor) } =>
-                    "$friendly_list will be coming to your desk" );
-
-            for my $user (@user_ids_to_message) {
-                $slack->send_message(
-                    $dm_channels{$user} => sprintf q{Everyone is meeting at <@%s>'s desk},
-                    $slack->find_user_id($party_requestor)
-                );
-            }
-        }
-
+        $party_promise->resolve();
     }
 };
 
-$slack->on( message => $idle_handler );    # begin by waiting for a party to form
-
-# Mojo::IOLoop->recurring(
-#     5 => sub {
-#         say sprintf 'forming a party: %s', $forming_a_party ? 'true' : 'false';
-#         p %party_responses;
-#         my %chans = get_dm_channels($slack);
-#         for ( keys %chans ) {
-#             say $slack->find_user_name($_);
-#         }
-#     }
-# );
+$slack->on( message => \&idle_handler );    # begin by waiting for a party to form
 
 $slack->start;
 
 sub get_dm_channels {
     my $slack = shift;
     return map { $_->{user} => $_->{id} } $slack->metadata->{ims}->@*;
+}
+
+sub users_in_party {
+    return grep { $party_responses{$_} } keys %party_responses;
+}
+
+sub users_not_in_party {
+    return grep { !defined $party_responses{$_} } keys %party_responses;
 }
