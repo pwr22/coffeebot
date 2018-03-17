@@ -1,0 +1,13 @@
+requires 'strict';
+requires 'warnings';
+requires 'feature';
+requires 'Log::ger';
+requires 'Log::ger::Output';
+requires 'Log::ger::Output::Screen';
+requires 'Log::ger::Util';
+requires 'Data::Printer';
+requires 'File::JSON::Slurper';
+requires 'Mojo::SlackRTM';
+requires 'Mojo::IOLoop';
+requires 'DateTime';
+requires 'Lingua::Conjunction';
